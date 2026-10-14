@@ -336,6 +336,7 @@ def apply_trigger_selection(
     # Build per-event booleans: did any electron / muon chain of the event's year fire?
     electron_pass = ak.zeros_like(ak.Array([False] * len(events)))
     muon_pass = ak.zeros_like(ak.Array([False] * len(events)))
+    photon_pass = ak.zeros_like(ak.Array([False] * len(events)))
     for year, in_year in trigger_years:
         if year not in chain_defs:
             raise ValueError(
@@ -351,9 +352,13 @@ def apply_trigger_selection(
             full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
             if full_branch in trig.fields:
                 muon_pass = muon_pass | (in_year & trig[full_branch])
-
+        for chain in year_chains.get("Photons" , []):
+            full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
+            if full_branch in trig.fields:
+                photon_pass = photon_pass | (in_year & trig[full_branch])
+                
     # Event passes if any lepton trigger fired
-    event_mask = electron_pass | muon_pass
+    event_mask = electron_pass | muon_pass | photon_pass
 
     # Log trigger efficiency
     n_total = len(events)
