@@ -68,8 +68,8 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
         ],
         
         "Photons":[
-            "AnalysisTrigMatch_HLT_g25_loose",
-            "AnalysisTrigMatch_HLT_g140_loose",
+            "HLT_Photon175",
+            "HLT_Photon165_HE10", 
         ]
     },
     "2016": {
@@ -83,8 +83,9 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
             "AnalysisTrigMatch_HLT_mu50",
         ],
         "Photons":[
-           "AnalysisTrigMatch_HLT_g35_loose",
-           "AnalysisTrigMatch_HLT_g140_loose",
+           "HLT_Photon175",
+            "HLT_Photon200",
+            "HLT_Photon165_HE10",
         ]
     },
     "2017": {
@@ -98,8 +99,7 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
             "AnalysisTrigMatch_HLT_mu50",
         ],
         "Photons":[
-            "AnalysisTrigMatch_HLT_g35_loose",
-            "AnalysisTrigMatch_HLT_g140_loose",
+           "HLT_Photon200",
         ]
     },
     "2018": {
@@ -113,8 +113,7 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
             "AnalysisTrigMatch_HLT_mu50",
         ],
         "Photons":[
-        "AnalysisTrigMatch_HLT_g35_loose",
-        "AnalysisTrigMatch_HLT_g140_loose",
+        "HLT_Photon200",
         ]
     },
 }
