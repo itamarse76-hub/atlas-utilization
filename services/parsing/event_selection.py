@@ -59,6 +59,25 @@ def normalize_yaml_kinematic_cuts(raw: Dict[str, Any]) -> Dict[str, Any]:
 
     return out
 
+def filter_cms_photons(photons: ak.Array, min_pt: float = 20.0) -> ak.Array:
+    """
+    Applies CMS object-level selection on Photons collection based on CMS H->gamma gamma:
+    - Exclusion of ECAL transition crack region (1.44 < |eta| < 1.57) up to |eta| < 2.5.
+    - Basic pT pre-selection threshold.
+    """
+    if photons is None or len(photons.fields) == 0:
+        return photons
+
+    abs_eta = np.abs(photons.eta)
+    
+    # CMS Acceptance: |eta| < 2.5 and NOT in barrel-endcap gap (1.44 < |eta| < 1.57)
+    valid_eta = (abs_eta < 2.5) & ~((abs_eta > 1.44) & (abs_eta < 1.57))
+    
+    # Pre-selection pT cut
+    valid_pt = photons.pt > min_pt
+
+    return photons[valid_eta & valid_pt]
+
 
 def apply_parsing_event_selection(
     events: ak.Array,
@@ -76,6 +95,15 @@ def apply_parsing_event_selection(
     """
     if allowed_objects is not None:
         events = retain_objects_for_storage(events, allowed_objects)
+
+    #Photon filtering ---- 
+    if "Photons" in events.fields:
+        events = ak.with_field(
+            events,
+            filter_cms_photons(events["Photons"], min_pt=20.0),
+            "Photons"
+        )
+    # --------------------------------------
 
     if kinematic_cuts:
         by_obj: Dict[str, Dict[str, Any]] = {}
@@ -353,7 +381,7 @@ def apply_trigger_selection(
             if full_branch in trig.fields:
                 muon_pass = muon_pass | (in_year & trig[full_branch])
         for chain in year_chains.get("Photons" , []):
-            full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
+            full_branch = chain if chain in trig.fields else chain + schemas.TRIGGER_BRANCH_SUFFIX
             if full_branch in trig.fields:
                 photon_pass = photon_pass | (in_year & trig[full_branch])
                 
@@ -376,4 +404,4 @@ def apply_trigger_selection(
     # Drop _triggerMatch from the output — it's event-level metadata that
     # would cause axis errors in downstream particle-level operations
     particle_fields = {f: filtered[f] for f in filtered.fields if f not in ("_triggerMatch", "_runNumber")}
-    return ak.zip(particle_fields, depth_limit=1)
+    return ak.zip(particle_fields, depth_limit=1)    
