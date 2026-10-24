@@ -70,6 +70,7 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
         "Photons":[
             "HLT_Photon175",
             "HLT_Photon165_HE10", 
+            "HLT_Diphoton30_18_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass95",
         ]
     },
     "2016": {
@@ -86,6 +87,9 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
            "HLT_Photon175",
             "HLT_Photon200",
             "HLT_Photon165_HE10",
+            "HLT_Diphoton30_18_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass90",
+            "HLT_Diphoton30_18_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass95",
+            "HLT_DoublePhoton60",
         ]
     },
     "2017": {
@@ -100,6 +104,8 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
         ],
         "Photons":[
            "HLT_Photon200",
+           "HLT_Diphoton30_22_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass90",
+           "HLT_Diphoton30_22_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass95",
         ]
     },
     "2018": {
@@ -114,6 +120,8 @@ SINGLE_LEPTON_TRIGGER_CHAINS = {
         ],
         "Photons":[
         "HLT_Photon200",
+        "HLT_Diphoton30_22_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass90",
+        "HLT_Diphoton30_22_R9Id_OR_isoCaloId_AND_HE_R9Id_Mass95",
         ]
     },
 }
