@@ -95,15 +95,13 @@ def apply_parsing_event_selection(
     """
     if allowed_objects is not None:
         events = retain_objects_for_storage(events, allowed_objects)
-
-    #Photon filtering ---- 
+        
     if "Photons" in events.fields:
         events = ak.with_field(
             events,
             filter_cms_photons(events["Photons"], min_pt=20.0),
             "Photons"
         )
-    # --------------------------------------
 
     if kinematic_cuts:
         by_obj: Dict[str, Dict[str, Any]] = {}
@@ -136,7 +134,8 @@ def apply_parsing_event_selection(
             is_exact_count=False,
             is_particle_counts_range=True,
         )
-
+    events = apply_overlap_removal(events)
+    events = filter_events_by_non_jet_object_total(events)
     return events
 
 
