@@ -11,6 +11,7 @@ import vector
 import gc
 from typing import Dict, Iterator, Tuple, Optional
 
+from domain.events import MC_EVENT_INFO_FIELD, particle_fields
 from services.calculations import consts
 from services.calculations.combinatorics import get_count, get_start
 
@@ -30,7 +31,7 @@ def calc_inv_mass(particle_events: ak.Array) -> ak.Array:
 
 def concat_events(particle_events: ak.Array) -> list:
     all_vectors = []
-    for particle_type in particle_events.fields:
+    for particle_type in particle_fields(particle_events):
         particle_array = particle_events[particle_type]
         mass = get_particle_known_mass(particle_type, particle_array)
         momentum_vector = vector.zip({
@@ -58,10 +59,15 @@ def extract_object_types(fields: list) -> set:
     return particle_types
 
 
+def count_particles(events: ak.Array) -> ak.Array:
+    """Per-event multiplicity of every particle collection (event-level fields excluded)."""
+    return ak.num(ak.zip({f: events[f] for f in particle_fields(events)}, depth_limit=1))
+
+
 def group_by_final_state(events: ak.Array) -> Iterator[Tuple[str, ak.Array]]:
     num_events = len(events)
     zero_array = ak.Array([0] * num_events) if num_events > 0 else ak.Array([])
-    particle_counts = ak.num(events)
+    particle_counts = count_particles(events)
 
     object_types = (
         ("Electrons", "e"), ("Muons", "m"), ("Jets", "j"),
@@ -90,18 +96,40 @@ def group_by_final_state(events: ak.Array) -> Iterator[Tuple[str, ak.Array]]:
 
 
 def limit_particles_in_fs(final_state: str, threshold: int) -> str:
+    JET_LETTER = "j"
     fs_particles = final_state.split('_')
-    for str_amount_particle in fs_particles:
-        if len(str_amount_particle) < 2:
+
+    # First pass: sum non-jet counts
+    non_jet_total = 0
+    for token in fs_particles:
+        if len(token) < 2:
             continue
-        amount_to_calc = str_amount_particle[:-1]
-        particle_letter = str_amount_particle[-1]
-        if amount_to_calc.isdigit():
-            amount = int(amount_to_calc)
-            if amount > threshold:
-                final_state = final_state.replace(
-                    f"{amount}{particle_letter}", f"{threshold}{particle_letter}")
-    return final_state
+        amount_str = token[:-1]
+        letter = token[-1]
+        if amount_str.isdigit() and letter != JET_LETTER:
+            non_jet_total += int(amount_str)
+
+    jet_slots = max(threshold - non_jet_total, 0)
+
+    # Second pass: rebuild with capped jet count
+    parts = []
+    for token in fs_particles:
+        if len(token) < 2:
+            parts.append(token)
+            continue
+        amount_str = token[:-1]
+        letter = token[-1]
+        if not amount_str.isdigit():
+            parts.append(token)
+            continue
+        amount = int(amount_str)
+        if letter == JET_LETTER:
+            parts.append(f"{min(amount, jet_slots)}{letter}")
+        elif amount > threshold:
+            parts.append(f"{threshold}{letter}")
+        else:
+            parts.append(token)
+    return "_".join(parts)
 
 
 def is_finalstate_contain_combination(final_state: str, combination: Dict) -> bool:
@@ -147,7 +175,7 @@ def filter_events_by_particle_counts(
     if len(events) == 0:
         return events
 
-    combined_mask = ak.ones_like(ak.num(events[events.fields[0]]), dtype=bool)
+    combined_mask = ak.ones_like(ak.num(events[particle_fields(events)[0]]), dtype=bool)
 
     for obj, value in particle_counts.items():
         if obj not in events.fields:
@@ -197,6 +225,9 @@ def filter_events_by_particle_counts(
 
         if len(fields_to_keep) == 0:
             return ak.Array([])
+        # Event-level MC info rides along with whichever particles are kept.
+        if MC_EVENT_INFO_FIELD in filtered_events.fields:
+            fields_to_keep[MC_EVENT_INFO_FIELD] = filtered_events[MC_EVENT_INFO_FIELD]
         filtered_events = ak.zip(fields_to_keep, depth_limit=1)
 
     return ak.to_packed(filtered_events)
@@ -266,10 +297,13 @@ def filter_events_by_kinematics(
     if _kinematic_cuts_is_per_object(kinematic_cuts):
         cuts_by_obj = kinematic_cuts
     else:
-        cuts_by_obj = {obj: kinematic_cuts for obj in events.fields}
+        cuts_by_obj = {obj: kinematic_cuts for obj in particle_fields(events)}
 
     filtered_events = {}
-    for obj in events.fields:
+    # Event-level MC info is not a particle collection; it passes through as is.
+    if MC_EVENT_INFO_FIELD in events.fields:
+        filtered_events[MC_EVENT_INFO_FIELD] = events[MC_EVENT_INFO_FIELD]
+    for obj in particle_fields(events):
         particles = events[obj]
         cuts = cuts_by_obj.get(obj)
         if cuts is None:
@@ -313,18 +347,26 @@ def filter_events_by_kinematics(
             phi_vals = ak.values_astype(particles.phi, float)
             mask = mask & (phi_vals >= cuts["phi"]["min"]) & (phi_vals <= cuts["phi"]["max"])
 
-        if obj == "Electrons" and cuts.get("rel_isolation_max") is not None:
-            iso_name = consts.ELECTRON_REL_ISOLATION_FIELD
-            if hasattr(particles, iso_name):
-                iso = getattr(particles, iso_name)
-                pt_vals = ak.values_astype(particles.pt, float)
-                iso_vals = ak.values_astype(iso, float)
-                rel = iso_vals / ak.where(pt_vals > 0, pt_vals, np.inf)
-                mask = mask & (rel < float(cuts["rel_isolation_max"]))
+        # --- isolation cut (electrons & muons) ---
+        if cuts.get("rel_isolation_max") is not None:
+            if obj == "Electrons":
+                iso_name = consts.ELECTRON_REL_ISOLATION_FIELD
+            elif obj == "Muons":
+                iso_name = consts.MUON_REL_ISOLATION_FIELD
             else:
-                raise ValueError(
-                    f"Electron rel_isolation_max requires missing field {iso_name!r}"
-                )
+                iso_name = None
+
+            if iso_name is not None:
+                if hasattr(particles, iso_name):
+                    iso = getattr(particles, iso_name)
+                    pt_vals = ak.values_astype(particles.pt, float)
+                    iso_vals = ak.values_astype(iso, float)
+                    rel = iso_vals / ak.where(pt_vals > 0, pt_vals, np.inf)
+                    mask = mask & (rel < float(cuts["rel_isolation_max"]))
+                else:
+                    raise ValueError(
+                        f"{obj} rel_isolation_max requires missing field {iso_name!r}"
+                    )
 
         # Boolean mask (not ak.mask) so dropped particles do not appear in lists
         filtered_events[obj] = particles[mask]

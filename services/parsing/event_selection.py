@@ -12,6 +12,7 @@ import awkward as ak
 import logging
 import numpy as np
 
+from domain.events import MC_EVENT_INFO_FIELD, particle_fields
 from services.calculations import physics_calcs
 from services.parsing import schemas
 
@@ -26,6 +27,11 @@ YAML_PARTICLE_KEYS: Dict[str, str] = {
 
 LIGHT_JET_FIELD = "Jets"
 MAX_NON_JET_OBJECTS = 4
+
+# Per-lepton MC trigger-match flag, set by attach_lepton_trigger_matches and
+# dropped by apply_lepton_trigger_selection.
+TRIGGER_MATCHED_FIELD = "_trigMatched"
+TRIGGER_LEPTON_FIELDS = ("Electrons", "Muons")
 
 
 def canonical_particle_field_name(key: str) -> str:
@@ -141,7 +147,7 @@ def apply_parsing_event_selection(
 
 def filter_events_by_non_jet_object_total(events: ak.Array) -> ak.Array:
     """Reject events with more than four retained non-light-jet objects."""
-    non_jet_fields = [field for field in events.fields if field != LIGHT_JET_FIELD]
+    non_jet_fields = [field for field in particle_fields(events) if field != LIGHT_JET_FIELD]
     if not non_jet_fields:
         return events
 
@@ -154,12 +160,15 @@ def filter_events_by_non_jet_object_total(events: ak.Array) -> ak.Array:
 def retain_objects_for_storage(
     events: ak.Array, objects_to_store: tuple[str, ...]
 ) -> ak.Array:
-    """Drop non-persisted physics collections before event selection."""
+    """Drop non-persisted physics collections before event selection.
+
+    Event-level MC info is not a physics collection and is always kept.
+    """
     return ak.zip(
         {
             field: events[field]
             for field in events.fields
-            if field in objects_to_store
+            if field in objects_to_store or field == MC_EVENT_INFO_FIELD
         },
         depth_limit=1,
     )
@@ -246,6 +255,29 @@ def _has_particles(collection: Optional[ak.Array]) -> bool:
             and len(collection.fields) > 0
             and int(ak.sum(ak.num(collection))) > 0)
 
+
+def _merge_jets(ljets, bjets):
+    """Concatenate light jets and b-jets, tagging each with _is_bjet."""
+    if not _has_particles(ljets) and not _has_particles(bjets):
+        return None
+    if _has_particles(ljets) and _has_particles(bjets):
+        common = [f for f in ljets.fields if f in bjets.fields]
+        lj_tagged = ak.zip({f: ljets[f] for f in common} | {"_is_bjet": ak.zeros_like(ljets.pt, dtype=bool)})
+        bj_tagged = ak.zip({f: bjets[f] for f in common} | {"_is_bjet": ak.ones_like(bjets.pt, dtype=bool)})
+        return ak.concatenate([lj_tagged, bj_tagged], axis=1)
+    if _has_particles(ljets):
+        return ak.zip({f: ljets[f] for f in ljets.fields} | {"_is_bjet": ak.zeros_like(ljets.pt, dtype=bool)})
+    return ak.zip({f: bjets[f] for f in bjets.fields} | {"_is_bjet": ak.ones_like(bjets.pt, dtype=bool)})
+
+
+def _split_jets(jets):
+    """Split merged jets back into (light, b-jets) using _is_bjet tag."""
+    is_b = jets["_is_bjet"]
+    keep = [f for f in jets.fields if not f.startswith("_is_bjet")]
+    clean = ak.zip({f: jets[f] for f in keep})
+    return clean[~is_b], clean[is_b]
+
+
 def apply_overlap_removal(
     events: ak.Array,
     cuts: Optional[Dict[str, Any]] = None,
@@ -260,7 +292,9 @@ def apply_overlap_removal(
 
     electrons = events["Electrons"] if "Electrons" in events.fields else None
     muons = events["Muons"] if "Muons" in events.fields else None
-    jets = events["Jets"] if "Jets" in events.fields else None
+    ljets = events["Jets"] if "Jets" in events.fields else None
+    bjets = events["BJets"] if "BJets" in events.fields else None
+    jets = _merge_jets(ljets, bjets)
     photons = events["Photons"] if "Photons" in events.fields else None
     taus = events["Taus"] if "Taus" in events.fields else None
 
@@ -313,12 +347,158 @@ def apply_overlap_removal(
     if jets is not None:
         if "NumTrkPt500" in jets.fields:
             jets = ak.zip({f: jets[f] for f in jets.fields if f != "NumTrkPt500"})
-        result = ak.with_field(result, jets, "Jets")
+        surviving_ljets, surviving_bjets = _split_jets(jets)
+        if ljets is not None:
+            result = ak.with_field(result, surviving_ljets, "Jets")
+        if bjets is not None:
+            result = ak.with_field(result, surviving_bjets, "BJets")
     if photons is not None:
         result = ak.with_field(result, photons, "Photons")
     if taus is not None:
         result = ak.with_field(result, taus, "Taus")
     return result
+
+def _trigger_years(events: ak.Array, release_year: str, file_path: str) -> list:
+    """(year, in_year) pairs: which events take each year's trigger chains."""
+    if "_runNumber" in events.fields:
+        # MC: each event's trigger year is set by its random run number
+        rrn = events["_runNumber"]
+        return [
+            (year, (rrn >= lo) & (rrn <= hi))
+            for year, (lo, hi) in schemas.YEAR_RUN_RANGES.items()
+        ]
+    # Data: the file's year applies to every event
+    return [
+        (year, True) for year in schemas.get_trigger_years(release_year, file_path)
+    ]
+
+
+def _year_chains(year: str) -> Dict[str, list]:
+    chain_defs = schemas.SINGLE_LEPTON_TRIGGER_CHAINS
+    if year not in chain_defs:
+        raise ValueError(
+            f"No trigger chains defined for year '{year}'. "
+            f"Supported: {sorted(chain_defs.keys())}"
+        )
+    return chain_defs[year]
+
+
+def _matched_lepton_mask(leptons: ak.Array, indices: ak.Array) -> ak.Array:
+    """Per-lepton [event][lepton] bool: True if the lepton's index is in *indices*."""
+    local = ak.local_index(leptons, axis=1)
+    lepton_side, matched_side = ak.unzip(
+        ak.cartesian([local, indices], axis=1, nested=True)
+    )
+    return ak.any(lepton_side == matched_side, axis=2)
+
+
+def attach_lepton_trigger_matches(
+    events: ak.Array,
+    release_year: str = "2024r-pp",
+    file_path: str = "",
+) -> ak.Array:
+    """
+    Mark every MC electron and muon matched to a single-lepton trigger.
+
+    Each electron and muon gets a boolean ``TRIGGER_MATCHED_FIELD``: True if
+    a chain of the event's trigger year links that lepton itself (the
+    ``_triggerMatch`` index lists hold the matched offline-object indices).
+    Run this before the object selection: the field then stays aligned with
+    the leptons that survive the kinematic, isolation and overlap-removal
+    cuts, and ``apply_lepton_trigger_selection`` requires one of them to be
+    matched.
+
+    Returns the events with the event-level ``_triggerMatch`` and
+    ``_runNumber`` fields dropped.
+    """
+    logger = logging.getLogger(__name__)
+
+    trig = events["_triggerMatch"] if "_triggerMatch" in events.fields else None
+    if trig is None:
+        logger.warning(
+            "No trigger-match branches on file %s: its %d events will fail "
+            "the trigger selection",
+            file_path, len(events),
+        )
+    trigger_years = _trigger_years(events, release_year, file_path)
+
+    result = events
+    for flavour in TRIGGER_LEPTON_FIELDS:
+        if flavour not in events.fields:
+            continue
+        leptons = events[flavour]
+        matched = ak.zeros_like(ak.local_index(leptons, axis=1), dtype=bool)
+        for year, in_year in trigger_years if trig is not None else []:
+            for chain in _year_chains(year).get(flavour, []):
+                full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
+                if full_branch not in trig.fields:
+                    continue
+                indices = trig[full_branch]
+                if ak.any(indices >= ak.num(leptons, axis=1)):
+                    raise ValueError(
+                        f"{full_branch} links a {flavour} index beyond the "
+                        f"{flavour} collection read from {file_path}"
+                    )
+                matched = matched | (in_year & _matched_lepton_mask(leptons, indices))
+        result = ak.with_field(
+            result, ak.with_field(leptons, matched, TRIGGER_MATCHED_FIELD), flavour
+        )
+
+    return ak.zip(
+        {f: result[f] for f in result.fields if f not in ("_triggerMatch", "_runNumber")},
+        depth_limit=1,
+    )
+
+
+def apply_lepton_trigger_selection(
+    events: ak.Array,
+    file_path: str = "",
+) -> ak.Array:
+    """
+    Keep only MC events in which a selected lepton is trigger-matched.
+
+    ATLAS single-lepton trigger requirement: at least one electron or muon
+    that passed the object selection must be the one matched to a fired
+    chain.  Call after ``attach_lepton_trigger_matches`` and after the
+    kinematic, isolation, overlap-removal and stored-object selections, so
+    only surviving leptons count.  Other leptons need not be matched.
+
+    Returns the filtered events with ``TRIGGER_MATCHED_FIELD`` dropped.
+    """
+    logger = logging.getLogger(__name__)
+
+    passes = {}
+    for flavour in TRIGGER_LEPTON_FIELDS:
+        leptons = events[flavour] if flavour in events.fields else None
+        if leptons is not None and TRIGGER_MATCHED_FIELD in leptons.fields:
+            passes[flavour] = ak.any(leptons[TRIGGER_MATCHED_FIELD], axis=1)
+        else:
+            passes[flavour] = ak.Array(np.zeros(len(events), dtype=bool))
+    electron_pass, muon_pass = passes["Electrons"], passes["Muons"]
+    event_mask = electron_pass | muon_pass
+
+    n_total = len(events)
+    n_pass = int(ak.sum(event_mask))
+    logger.info(
+        "Trigger selection (selected leptons): %d / %d events pass (%.1f%%), "
+        "electron-only: %d, muon-only: %d in %s",
+        n_pass, n_total, 100 * n_pass / n_total if n_total else 0,
+        int(ak.sum(electron_pass & ~muon_pass)),
+        int(ak.sum(muon_pass & ~electron_pass)),
+        file_path,
+    )
+
+    result = events[event_mask]
+    for flavour in TRIGGER_LEPTON_FIELDS:
+        if flavour in result.fields and TRIGGER_MATCHED_FIELD in result[flavour].fields:
+            leptons = result[flavour]
+            result = ak.with_field(
+                result,
+                ak.zip({f: leptons[f] for f in leptons.fields if f != TRIGGER_MATCHED_FIELD}),
+                flavour,
+            )
+    return result
+
 
 def apply_trigger_selection(
     events: ak.Array,
@@ -328,9 +508,12 @@ def apply_trigger_selection(
     """
     Keep only events where at least one lepton fired a single-lepton trigger.
 
-    The ``_triggerMatch`` field (if present) is a record of per-event booleans,
-    one per trigger chain.  An event passes if ANY electron chain OR ANY muon
-    chain is True.
+    Event-level check used for collision data: the ``_triggerMatch`` field
+    (if present) is a record of per-event matched-index lists, one per
+    trigger chain.  An event passes if ANY electron chain OR ANY muon chain
+    matched an object.  MC uses ``attach_lepton_trigger_matches`` and
+    ``apply_lepton_trigger_selection`` instead, which require a selected
+    lepton to be the matched one.
 
     Returns the filtered events array (``_triggerMatch`` field is dropped
     from the output to avoid downstream issues with non-particle fields).
@@ -345,36 +528,18 @@ def apply_trigger_selection(
         return events[:0]
 
     trig = events["_triggerMatch"]
-    chain_defs = schemas.SINGLE_LEPTON_TRIGGER_CHAINS
-
-    if "_runNumber" in events.fields:
-        # MC: each event's trigger year is set by its random run number
-        rrn = events["_runNumber"]
-        trigger_years = [
-            (year, (rrn >= lo) & (rrn <= hi))
-            for year, (lo, hi) in schemas.YEAR_RUN_RANGES.items()
-        ]
-    else:
-        # Data: the file's year applies to every event
-        trigger_years = [
-            (year, True) for year in schemas.get_trigger_years(release_year, file_path)
-        ]
+    trigger_years = _trigger_years(events, release_year, file_path)
 
     # Build per-event booleans: did any electron / muon chain of the event's year fire?
     electron_pass = ak.zeros_like(ak.Array([False] * len(events)))
     muon_pass = ak.zeros_like(ak.Array([False] * len(events)))
     photon_pass = ak.zeros_like(ak.Array([False] * len(events)))
     for year, in_year in trigger_years:
-        if year not in chain_defs:
-            raise ValueError(
-                f"No trigger chains defined for year '{year}'. "
-                f"Supported: {sorted(chain_defs.keys())}"
-            )
-        year_chains = chain_defs[year]
+        year_chains = _year_chains(year)
         for chain in year_chains.get("Electrons", []):
             full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
             if full_branch in trig.fields:
-                electron_pass = electron_pass | (in_year & trig[full_branch])
+                electron_pass = electron_pass | (in_year & (ak.num(trig[full_branch], axis=1) > 0))
         for chain in year_chains.get("Muons", []):
             full_branch = chain + schemas.TRIGGER_BRANCH_SUFFIX
             if full_branch in trig.fields:
@@ -384,6 +549,8 @@ def apply_trigger_selection(
             if full_branch in trig.fields:
                 photon_pass = photon_pass | (in_year & trig[full_branch])
                 
+                muon_pass = muon_pass | (in_year & (ak.num(trig[full_branch], axis=1) > 0))
+
     # Event passes if any lepton trigger fired
     event_mask = electron_pass | muon_pass | photon_pass
 

@@ -9,6 +9,7 @@ import vector
 from typing import Dict, Iterator, List
 from collections import Counter
 
+from domain.events import particle_fields
 from services.calculations import consts, physics_calcs
 from services.calculations.combinatorics import get_count, get_start
 
@@ -44,7 +45,7 @@ class IMCalculator:
 
     def _concat_particles_to_vectors(self, particle_events: ak.Array) -> List[ak.Array]:
         all_vectors = []
-        for particle_type in particle_events.fields:
+        for particle_type in particle_fields(particle_events):
             particle_array = particle_events[particle_type]
             mass = self._get_particle_mass(particle_type, particle_array)
             momentum_vector = vector.zip({
@@ -62,7 +63,7 @@ class IMCalculator:
 
     def _get_all_events_fs(self) -> ak.Array:
         if self._all_events_fs is None:
-            particle_counts = ak.num(self.events)
+            particle_counts = physics_calcs.count_particles(self.events)
             num_events = len(self.events)
             zero_array = ak.Array([0] * num_events) if num_events > 0 else ak.Array([])
 
@@ -73,11 +74,12 @@ class IMCalculator:
             ]
 
             all_events_fs = [
-                "_".join(
-                    f"{count}{letter}"
-                    for (_name, letter, _values), count in zip(present_types, counts)
+                self._limit_particles_in_fs(
+                    "_".join(
+                        f"{count}{letter}"
+                        for (_name, letter, _values), count in zip(present_types, counts)
+                    )
                 )
-                # This is used to create a mask later on, so we must keep this the same length as the event list.
                 if self._is_valid_fs(counts, present_types) else ""
                 for counts in zip(*[values for _name, _letter, values in present_types])
             ]
@@ -122,18 +124,7 @@ class IMCalculator:
 
     @staticmethod
     def _limit_particles_in_fs(final_state: str, threshold: int = 4) -> str:
-        fs_particles = final_state.split('_')
-        for str_amount_particle in fs_particles:
-            if len(str_amount_particle) < 2:
-                continue
-            amount_to_calc = str_amount_particle[:-1]
-            particle_letter = str_amount_particle[-1]
-            if amount_to_calc.isdigit():
-                amount = int(amount_to_calc)
-                if amount > threshold:
-                    final_state = final_state.replace(
-                        f"{amount}{particle_letter}", f"{threshold}{particle_letter}")
-        return final_state
+        return physics_calcs.limit_particles_in_fs(final_state, threshold)
 
     @staticmethod
     def does_final_state_contain_combination(final_state: str, combination: Dict) -> bool:
